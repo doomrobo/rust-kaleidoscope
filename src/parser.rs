@@ -1,5 +1,20 @@
 use lexer::Token;
 use std::fmt;
+use std::collections::HashMap;
+
+lazy_static! {
+    // Operator precedence table. The higher the number the tighter it binds
+    static ref OP_PRECEDENCE: HashMap<String, usize> = {
+        let mut m = HashMap::new();
+        m.insert("<".to_string(), 10);
+        m.insert("+".to_string(), 20);
+        m.insert("-".to_string(), 20);
+        m.insert("*".to_string(), 40);
+        m.insert("/".to_string(), 40);
+        m.insert("**".to_string(), 50);
+        m
+    };
+}
 
 pub type ASTForest = Vec<StmtOrExpr>;
 type ParserRes<'a, T> = Result<(T, &'a [Token]), String>;
@@ -140,14 +155,19 @@ macro_rules! eat {
     }
 }
 
-fn peek(input: &[Token]) -> &Token {
+fn peek_opt(input: &[Token]) -> Option<&Token> {
     if input.len() == 0 {
-        panic!("Unexpected end of file");
+        None
     }
     else {
-        &input[0]
+        Some(&input[0])
     }
 }
+
+fn peek(input: &[Token]) -> &Token {
+    peek_opt(input).expect("Unexpected end of file")
+}
+
 
 fn parse_delimited_helper<'a, T>(item_parser: Parser<'a, T>, delimiter: Token, input: &'a [Token],
                                  mut acc: Vec<T>) -> ParserRes<'a, Vec<T>> {
@@ -239,25 +259,59 @@ fn parse_primary_expr(input: &[Token]) -> ParserRes<Expr> {
     }
 }
 
-fn parse_expr(input: &[Token]) -> ParserRes<Expr> {
-    let (expr_a, input) = parse_primary_expr(input)?;
-    if input.len() == 0 {
-        return Ok((expr_a, input));
+fn apply_precedence_rules(mut operands: Vec<Expr>, mut operators: Vec<String>)
+   -> Result<Expr, String> {
+    // Should only happen when there is exactly one element in operands
+    if operators.is_empty() {
+        return Ok(operands.pop().expect("Unexpected error in binary op parsing"));
     }
 
-    match peek(input) {
-        &Token::Op(ref op) => {
-            pop!(input);
-            let (expr_b, input) = parse_expr(input)?;
-            let bin_op = Expr::BinaryOp {
-                a: Box::new(expr_a),
-                op: op.to_string(),
-                b: Box::new(expr_b),
-            };
-            Ok((bin_op, input))
+    let mut winning_op_idx = 0usize;
+    let mut max_prec = 0usize;
+    for (i, op) in operators.iter().enumerate() {
+        let p = *OP_PRECEDENCE.get(op).ok_or(format!("Unknown operator '{}'", op))?;
+        if p > max_prec {
+            max_prec = p;
+            winning_op_idx = i;
         }
-        _ => Ok((expr_a, input))
     }
+
+    let op = operators.remove(winning_op_idx);
+    let expr_a = operands.remove(winning_op_idx);
+    let expr_b = operands.remove(winning_op_idx);
+    let expr = Expr::BinaryOp {
+        a: Box::new(expr_a),
+        op: op,
+        b: Box::new(expr_b),
+    };
+
+    operands.insert(winning_op_idx, expr);
+    apply_precedence_rules(operands, operators)
+}
+
+// Breaks up expressions into binops and primary expressions. Then applies precedence rules
+fn parse_expr_helper(input: &[Token], mut operands: Vec<Expr>, mut operators: Vec<String>)
+   -> ParserRes<Expr> {
+    match peek_opt(input) {
+        Some(&Token::Op(ref op)) => {
+            pop!(input);
+            let (expr, input) = parse_primary_expr(input)?;
+            operands.push(expr);
+            operators.push(op.to_string());
+            parse_expr_helper(input, operands, operators)
+        }
+        _ => {
+            let expr = apply_precedence_rules(operands, operators)?;
+            Ok((expr, input))
+        }
+    }
+}
+
+fn parse_expr(input: &[Token]) -> ParserRes<Expr> {
+    let (first_primary, input) = parse_primary_expr(input)?;
+    let operands = vec![first_primary];
+    let operators = Vec::new();
+    parse_expr_helper(input, operands, operators)
 }
 
 fn parse_def(input: &[Token]) -> ParserRes<Function> {
@@ -308,15 +362,18 @@ pub fn parse(input: &[Token]) -> ParserRes<ASTForest> {
 
 #[test]
 fn test_parse_proto() {
-    parse_proto(&[Token::Ident("hello".to_string()), Token::OpenParen,
+    let proto = &[Token::Ident("hello".to_string()), Token::OpenParen,
                   Token::Ident("a".to_string()), Token::Comma, Token::Ident("b".to_string()),
-                  Token::Comma, Token::Ident("c".to_string()), Token::Comma,
-                  Token::CloseParen]).unwrap();
+                  Token::Comma, Token::Ident("c".to_string()), Token::Comma, Token::CloseParen];
+    let expected_pretty = "hello (a, b, c)";
+    let (parsed, _) = parse_proto(proto).unwrap();
+
+    assert_eq!(&*format!("{}", parsed), expected_pretty);
 }
 
 #[test]
 fn test_parse_expr() {
-    // This is the string "1 + hello + (3.4 / 5) * 2 ** f(50, 1.1, g(2.2)) + 4"
+    // This is the string "1 + hello + (3.4 / 5) * 2 ** f(50, 1.1, g(2.2 - 1.1)) + 4"
     let expr = {
         use lexer::Token::*;
         &[Num(1.), Op("+".to_string()), Ident("hello".to_string()), Op("+".to_string()), OpenParen,
@@ -325,52 +382,8 @@ fn test_parse_expr() {
           Comma, Ident("g".to_string()), OpenParen, Num(2.2), Op("-".to_string()), Num(1.1),
           CloseParen, CloseParen, Op("+".to_string()), Num(4.)]
     };
-    let expected = {
-        use self::Expr::*;
-
-        BinaryOp {
-          a: Box::new(NumLit(1.)),
-          op: "+".to_string(),
-          b: Box::new(BinaryOp {
-            a: Box::new(Ident("hello".to_string())),
-            op: "+".to_string(),
-            b: Box::new(BinaryOp {
-              a: Box::new(BinaryOp {
-                a: Box::new(NumLit(3.4)),
-                op: "/".to_string(),
-                b: Box::new(NumLit(5.))
-              }),
-              op: "*".to_string(),
-              b: Box::new(BinaryOp {
-                a: Box::new(NumLit(2.)),
-                op: "**".to_string(),
-                b: Box::new(BinaryOp {
-                  a: Box::new(Call {
-                    func_name: "f".to_string(),
-                    args: vec![
-                      NumLit(50.),
-                      NumLit(1.1),
-                      Call {
-                        func_name: "g".to_string(),
-                        args: vec![
-                          BinaryOp {
-                            a: Box::new(NumLit(2.2)),
-                            op: "-".to_string(),
-                            b: Box::new(NumLit(1.1))
-                          }
-                        ]
-                      }
-                    ]
-                  }),
-                  op: "+".to_string(),
-                  b: Box::new(NumLit(4.))
-                })
-              })
-            })
-          })
-        }
-    };
+    let expected_pretty = "((1 + hello) + ((3.4 / 5) * (2 ** f(50, 1.1, g(2.2 - 1.1))))) + 4";
 
     let (parsed, _) = parse_expr(expr).unwrap();
-    assert_eq!(parsed, expected);
+    assert_eq!(&*format!("{}", parsed), expected_pretty);
 }
