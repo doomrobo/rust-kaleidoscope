@@ -1,4 +1,5 @@
 use lexer::Token;
+
 use std::fmt;
 use std::collections::HashMap;
 
@@ -17,7 +18,8 @@ lazy_static! {
 }
 
 pub type ASTForest = Vec<StmtOrExpr>;
-type ParserRes<'a, T> = Result<(T, &'a [Token]), String>;
+// Returns either (AST node, rest of input) or (error str, rest of input)
+type ParserRes<'a, T> = Result<(T, &'a [Token]), (String, &'a [Token])>;
 type Parser<'a, T> = Box<Fn(&'a [Token]) -> ParserRes<'a, T>>;
 
 #[derive(Debug)]
@@ -57,6 +59,24 @@ pub struct Function {
 pub struct Prototype {
     name: String,
     args: Vec<String>,
+}
+
+// Wrapper type around Option<&Token> so that we can impl Display for it.
+struct TokOptWrapper<'a>(Option<&'a Token>);
+impl<'a> From<Option<&'a Token>> for TokOptWrapper<'a> {
+    fn from(t: Option<&'a Token>) -> TokOptWrapper<'a> {
+        TokOptWrapper(t)
+    }
+}
+
+// Will display the Debug form of the token when it is not None. Otherwise it will display "EOF"
+impl<'a> fmt::Display for TokOptWrapper<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.0 {
+            Some(ref tok) => write!(f, "{:?}", tok),
+            None => f.write_str("EOF"),
+        }
+    }
 }
 
 impl fmt::Display for StmtOrExpr {
@@ -99,6 +119,8 @@ impl fmt::Display for Expr {
         match self {
             &Expr::Ident(ref s) => f.write_str(s),
             &Expr::NumLit(n) => write!(f, "{}", n),
+            // Binary operations will have parentheses around the operands iff the operands are
+            // binary operations themselves
             &Expr::BinaryOp { ref a, ref op, ref b } => {
                 if let &Expr::BinaryOp {..} = a.as_ref() {
                     write!(f, "({})", a)?;
@@ -131,27 +153,31 @@ impl fmt::Display for Expr {
     }
 }
 
+// Ratchets input forward by one token
 macro_rules! pop {
     ( $input:ident ) => {
         let $input = &$input[1..];
     }
 }
 
-macro_rules! read_one {
-    ( $tok:expr, $input:ident ) => {
-        if peek($input) == &$tok {
-            Some(())
+// pop the input and expect the given token. If it's not what was expected, panic
+macro_rules! eat {
+    ( $tok:expr, $input:ident) => {
+        if !read_one(&$tok, $input) {
+            return Err((format!("Expected {:?}. Got {}.",
+                                $tok,
+                                TokOptWrapper::from($input.get(0))),
+                        $input));
         }
-        else {
-            None
-        }
+        pop!($input);
     }
 }
 
-macro_rules! eat {
-    ( $tok:expr, $input:ident) => {
-        read_one!($tok, $input).expect(&*format!("expected {:?}, got {:?}", $tok, $input[0]));
-        pop!($input);
+// Returns true if the expected token was read. false otherwise.
+fn read_one(tok: &Token, input: &[Token]) -> bool {
+    match peek_opt(input) {
+        Some(next) => next == tok,
+        None => false
     }
 }
 
@@ -168,13 +194,13 @@ fn peek(input: &[Token]) -> &Token {
     peek_opt(input).expect("Unexpected end of file")
 }
 
-
+// Parses a sequence of the form [<delim> <item>]* <delim> ?
 fn parse_delimited_helper<'a, T>(item_parser: Parser<'a, T>, delimiter: Token, input: &'a [Token],
                                  mut acc: Vec<T>) -> ParserRes<'a, Vec<T>> {
-    if peek(input) != &delimiter {
+    // If there's no delimiter, we're done
+    if peek_opt(input) != Some(&delimiter) {
         return Ok((acc, input));
     }
-
     pop!(input);
 
     if let Ok((val, input)) = item_parser(input) {
@@ -186,11 +212,12 @@ fn parse_delimited_helper<'a, T>(item_parser: Parser<'a, T>, delimiter: Token, i
     }
 }
 
+// Parses 0 or more nodes using item_parser, delimited by the given delimiter
 fn parse_delimited<'a, T>(item_parser: Parser<'a, T>, delimiter: Token, input: &'a [Token])
    -> ParserRes<'a, Vec<T>> {
     let mut coll = Vec::new();
 
-    // Get the first value
+    // Get the first value. If there is none, return an empty vec
     if let Ok((val, input)) = item_parser(input) {
         coll.push(val);
         let (coll, input) = parse_delimited_helper(item_parser, delimiter, input, coll)?;
@@ -202,11 +229,13 @@ fn parse_delimited<'a, T>(item_parser: Parser<'a, T>, delimiter: Token, input: &
 }
 
 fn parse_ident(input: &[Token]) -> ParserRes<String> {
-    if let Token::Ident(ref s) = input[0] {
-        Ok((s.to_string(), &input[1..]))
+    let tok = peek_opt(input);
+    if let Some(&Token::Ident(ref s)) = tok {
+        pop!(input);
+        Ok((s.to_string(), input))
     }
     else {
-        Err(format!("Expected identifier. Got {:?}.", input[0]))
+        Err((format!("Expected identifier. Got {}.", TokOptWrapper::from(tok)), input))
     }
 }
 
@@ -230,17 +259,16 @@ fn parse_parenthesized_expr(input: &[Token]) -> ParserRes<Expr> {
 }
 
 fn parse_primary_expr(input: &[Token]) -> ParserRes<Expr> {
-    let tok = peek(input);
-    match tok {
-        &Token::OpenParen => parse_parenthesized_expr(input),
-        &Token::Num(n) => {
+    match peek_opt(input) {
+        Some(&Token::OpenParen) => parse_parenthesized_expr(input),
+        Some(&Token::Num(n)) => {
             pop!(input);
             Ok((Expr::NumLit(n), input))
         },
-        &Token::Ident(ref ident) => {
+        Some(&Token::Ident(ref ident)) => {
             pop!(input);
             // It's a function call
-            if peek(input) == &Token::OpenParen {
+            if read_one(&Token::OpenParen, input) {
                 pop!(input);
                 let (args, input) = parse_delimited(Box::new(parse_expr),
                                                     Token::Comma, input)?;
@@ -255,7 +283,7 @@ fn parse_primary_expr(input: &[Token]) -> ParserRes<Expr> {
                 Ok((Expr::Ident(ident.to_string()), input))
             }
         }
-        _ => Err(format!("expected an expression, got {:?}", tok))
+        tok => Err((format!("Expected expression. Got {}.", TokOptWrapper::from(tok)), input))
     }
 }
 
@@ -269,13 +297,15 @@ fn apply_precedence_rules(mut operands: Vec<Expr>, mut operators: Vec<String>)
     let mut winning_op_idx = 0usize;
     let mut max_prec = 0usize;
     for (i, op) in operators.iter().enumerate() {
-        let p = *OP_PRECEDENCE.get(op).ok_or(format!("Unknown operator '{}'", op))?;
+        // We can unwrap here because the condition is checked in parse_expr_helper
+        let p = *OP_PRECEDENCE.get(op).unwrap();
         if p > max_prec {
             max_prec = p;
             winning_op_idx = i;
         }
     }
 
+    // Group together the tighest-binding operands, and put them back in the vector as a BinOp
     let op = operators.remove(winning_op_idx);
     let expr_a = operands.remove(winning_op_idx);
     let expr_b = operands.remove(winning_op_idx);
@@ -293,20 +323,29 @@ fn apply_precedence_rules(mut operands: Vec<Expr>, mut operators: Vec<String>)
 fn parse_expr_helper(input: &[Token], mut operands: Vec<Expr>, mut operators: Vec<String>)
    -> ParserRes<Expr> {
     match peek_opt(input) {
+        // Read an operator and a primary expression
         Some(&Token::Op(ref op)) => {
+            if OP_PRECEDENCE.get(op).is_none() {
+                return Err((format!("Unknown operator '{}'", op), input));
+            }
+
             pop!(input);
             let (expr, input) = parse_primary_expr(input)?;
             operands.push(expr);
             operators.push(op.to_string());
             parse_expr_helper(input, operands, operators)
         }
-        _ => {
-            let expr = apply_precedence_rules(operands, operators)?;
-            Ok((expr, input))
+        // Otherwise we're done
+        _ => match apply_precedence_rules(operands, operators) {
+                Ok(expr) => Ok((expr, input)),
+                Err(s) => Err((s, input))
         }
     }
 }
 
+// Exprs are of the form <primary_expr> [<op> <primary_expr>]*
+// So parse the first one, and then collect the rest, then apply to the global operator precedence
+// rules to turn it into a single BinOp expression
 fn parse_expr(input: &[Token]) -> ParserRes<Expr> {
     let (first_primary, input) = parse_primary_expr(input)?;
     let operands = vec![first_primary];
@@ -317,6 +356,7 @@ fn parse_expr(input: &[Token]) -> ParserRes<Expr> {
 fn parse_def(input: &[Token]) -> ParserRes<Function> {
     eat!(Token::Def, input);
     let (proto, input) = parse_proto(input)?;
+    // Function bodies are a single expr, I suppose
     let (body, input) = parse_expr(input)?;
     let func = Function {
         proto: proto,
@@ -331,30 +371,35 @@ fn parse_extern(input: &[Token]) -> ParserRes<Prototype> {
     parse_proto(input)
 }
 
+// Top-level parser
 fn parse_helper(input: &[Token], mut prog: ASTForest) -> ParserRes<ASTForest> {
-    if input.len() == 0 {
-        return Ok((prog, input));
-    }
-    match peek(input) {
-        &Token::Def => {
+    // Top-level nodes are either statements (def or extern) or expressions
+    match peek_opt(input) {
+        Some(&Token::Def) => {
             let (func, input) = parse_def(input)?;
             prog.push(StmtOrExpr::Stmt(Stmt::Function(func)));
             parse_helper(input, prog)
         }
-        &Token::Extern => {
+        Some(&Token::Extern) => {
             let (proto, input) = parse_extern(input)?;
             prog.push(StmtOrExpr::Stmt(Stmt::Prototype(proto)));
             parse_helper(input, prog)
         }
-        _ => {
+        // If it's not a def or an extern prototype, assume it's an expression
+        Some(_) => {
             let (expr, input) = parse_expr(input)?;
             prog.push(StmtOrExpr::Expr(expr));
             eat!(Token::Delim, input);
             parse_helper(input, prog)
         }
+        // EOF, return what we have
+        None => {
+            Ok((prog, input))
+        }
     }
 }
 
+// Makes an empty vector for the top-level forest and passes it to parse_helper
 pub fn parse(input: &[Token]) -> ParserRes<ASTForest> {
     let prog = Vec::new();
     parse_helper(input, prog)
@@ -368,6 +413,7 @@ fn test_parse_proto() {
     let expected_pretty = "hello (a, b, c)";
     let (parsed, _) = parse_proto(proto).unwrap();
 
+    println!("parsed == {:#?}", parsed);
     assert_eq!(&*format!("{}", parsed), expected_pretty);
 }
 
