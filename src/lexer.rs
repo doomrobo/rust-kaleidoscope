@@ -26,7 +26,7 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                               r"(?P<close_paren>\))|",
                               r"(?P<comma>,)|",
                               r"(?P<num>\d+\.?\d*)|",
-                              r"(?P<op>\S+)|",
+                              r"(?P<op>[\p{P}\p{Sm}]+)|", // Punctuation and math symbols
                               r"\s*");
     let comment_re = Regex::new(comment_re_str).unwrap();
     let lang_re = Regex::new(lang_re_str).unwrap();

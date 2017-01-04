@@ -7,3 +7,5 @@ authors = ["Michael Rosenberg <42micro@gmail.com>"]
 docopt = "0.6"
 lazy_static = "0.2"
 regex = "0.1"
+llvm-sys = "0.4"
+llvm-alt = "0.5"

@@ -19,8 +19,8 @@ lazy_static! {
 
 pub type ASTForest = Vec<StmtOrExpr>;
 // Returns either (AST node, rest of input) or (error str, rest of input)
-type ParserRes<'a, T> = Result<(T, &'a [Token]), (String, &'a [Token])>;
-type Parser<'a, T> = Box<Fn(&'a [Token]) -> ParserRes<'a, T>>;
+pub type ParseResult<'a, T> = Result<(T, &'a [Token]), (String, &'a [Token])>;
+type Parser<'a, T> = Box<Fn(&'a [Token]) -> ParseResult<'a, T>>;
 
 #[derive(Debug)]
 pub enum StmtOrExpr {
@@ -44,21 +44,21 @@ pub enum Expr {
         b: Box<Expr>,
     },
     Call {
-        func_name: String,
+        target: String,
         args: Vec<Expr>
     },
 }
 
 #[derive(Debug)]
 pub struct Function {
-    proto: Prototype,
-    body: Expr
+    pub proto: Prototype,
+    pub body: Expr
 }
 
 #[derive(Debug)]
 pub struct Prototype {
-    name: String,
-    args: Vec<String>,
+    pub name: String,
+    pub args: Vec<String>,
 }
 
 // Wrapper type around Option<&Token> so that we can impl Display for it.
@@ -138,8 +138,8 @@ impl fmt::Display for Expr {
                     write!(f, "{}", b)
                 }
             }
-            &Expr::Call { ref func_name, ref args } => {
-                write!(f, "{}(", func_name)?;
+            &Expr::Call { ref target, ref args } => {
+                write!(f, "{}(", target)?;
                 let mut arg_it = args.iter();
                 if let Some(first) = arg_it.next() {
                     write!(f, "{}", first)?;
@@ -190,13 +190,9 @@ fn peek_opt(input: &[Token]) -> Option<&Token> {
     }
 }
 
-fn peek(input: &[Token]) -> &Token {
-    peek_opt(input).expect("Unexpected end of file")
-}
-
 // Parses a sequence of the form [<delim> <item>]* <delim> ?
 fn parse_delimited_helper<'a, T>(item_parser: Parser<'a, T>, delimiter: Token, input: &'a [Token],
-                                 mut acc: Vec<T>) -> ParserRes<'a, Vec<T>> {
+                                 mut acc: Vec<T>) -> ParseResult<'a, Vec<T>> {
     // If there's no delimiter, we're done
     if peek_opt(input) != Some(&delimiter) {
         return Ok((acc, input));
@@ -214,7 +210,7 @@ fn parse_delimited_helper<'a, T>(item_parser: Parser<'a, T>, delimiter: Token, i
 
 // Parses 0 or more nodes using item_parser, delimited by the given delimiter
 fn parse_delimited<'a, T>(item_parser: Parser<'a, T>, delimiter: Token, input: &'a [Token])
-   -> ParserRes<'a, Vec<T>> {
+   -> ParseResult<'a, Vec<T>> {
     let mut coll = Vec::new();
 
     // Get the first value. If there is none, return an empty vec
@@ -228,7 +224,7 @@ fn parse_delimited<'a, T>(item_parser: Parser<'a, T>, delimiter: Token, input: &
     }
 }
 
-fn parse_ident(input: &[Token]) -> ParserRes<String> {
+fn parse_ident(input: &[Token]) -> ParseResult<String> {
     let tok = peek_opt(input);
     if let Some(&Token::Ident(ref s)) = tok {
         pop!(input);
@@ -239,7 +235,7 @@ fn parse_ident(input: &[Token]) -> ParserRes<String> {
     }
 }
 
-fn parse_proto(input: &[Token]) -> ParserRes<Prototype> {
+fn parse_proto(input: &[Token]) -> ParseResult<Prototype> {
     let (name, input) = parse_ident(input)?;
     eat!(Token::OpenParen, input);
     let (args, input) = parse_delimited(Box::new(parse_ident), Token::Comma, input)?;
@@ -251,14 +247,14 @@ fn parse_proto(input: &[Token]) -> ParserRes<Prototype> {
     Ok((proto, input))
 }
 
-fn parse_parenthesized_expr(input: &[Token]) -> ParserRes<Expr> {
+fn parse_parenthesized_expr(input: &[Token]) -> ParseResult<Expr> {
     eat!(Token::OpenParen, input);
     let (expr, input) = parse_expr(input)?;
     eat!(Token::CloseParen, input);
     Ok((expr, input))
 }
 
-fn parse_primary_expr(input: &[Token]) -> ParserRes<Expr> {
+fn parse_primary_expr(input: &[Token]) -> ParseResult<Expr> {
     match peek_opt(input) {
         Some(&Token::OpenParen) => parse_parenthesized_expr(input),
         Some(&Token::Num(n)) => {
@@ -274,7 +270,7 @@ fn parse_primary_expr(input: &[Token]) -> ParserRes<Expr> {
                                                     Token::Comma, input)?;
                 eat!(Token::CloseParen, input);
                 let call = Expr::Call {
-                    func_name: ident.to_string(),
+                    target: ident.to_string(),
                     args: args,
                 };
                 Ok((call, input))
@@ -321,7 +317,7 @@ fn apply_precedence_rules(mut operands: Vec<Expr>, mut operators: Vec<String>)
 
 // Breaks up expressions into binops and primary expressions. Then applies precedence rules
 fn parse_expr_helper(input: &[Token], mut operands: Vec<Expr>, mut operators: Vec<String>)
-   -> ParserRes<Expr> {
+   -> ParseResult<Expr> {
     match peek_opt(input) {
         // Read an operator and a primary expression
         Some(&Token::Op(ref op)) => {
@@ -346,14 +342,14 @@ fn parse_expr_helper(input: &[Token], mut operands: Vec<Expr>, mut operators: Ve
 // Exprs are of the form <primary_expr> [<op> <primary_expr>]*
 // So parse the first one, and then collect the rest, then apply to the global operator precedence
 // rules to turn it into a single BinOp expression
-fn parse_expr(input: &[Token]) -> ParserRes<Expr> {
+fn parse_expr(input: &[Token]) -> ParseResult<Expr> {
     let (first_primary, input) = parse_primary_expr(input)?;
     let operands = vec![first_primary];
     let operators = Vec::new();
     parse_expr_helper(input, operands, operators)
 }
 
-fn parse_def(input: &[Token]) -> ParserRes<Function> {
+fn parse_def(input: &[Token]) -> ParseResult<Function> {
     eat!(Token::Def, input);
     let (proto, input) = parse_proto(input)?;
     // Function bodies are a single expr, I suppose
@@ -366,13 +362,13 @@ fn parse_def(input: &[Token]) -> ParserRes<Function> {
     Ok((func, input))
 }
 
-fn parse_extern(input: &[Token]) -> ParserRes<Prototype> {
+fn parse_extern(input: &[Token]) -> ParseResult<Prototype> {
     eat!(Token::Extern, input);
     parse_proto(input)
 }
 
 // Top-level parser
-fn parse_helper(input: &[Token], mut prog: ASTForest) -> ParserRes<ASTForest> {
+fn parse_helper(input: &[Token], mut prog: ASTForest) -> ParseResult<ASTForest> {
     // Top-level nodes are either statements (def or extern) or expressions
     match peek_opt(input) {
         Some(&Token::Def) => {
@@ -400,7 +396,7 @@ fn parse_helper(input: &[Token], mut prog: ASTForest) -> ParserRes<ASTForest> {
 }
 
 // Makes an empty vector for the top-level forest and passes it to parse_helper
-pub fn parse(input: &[Token]) -> ParserRes<ASTForest> {
+pub fn parse(input: &[Token]) -> ParseResult<ASTForest> {
     let prog = Vec::new();
     parse_helper(input, prog)
 }
@@ -413,7 +409,6 @@ fn test_parse_proto() {
     let expected_pretty = "hello (a, b, c)";
     let (parsed, _) = parse_proto(proto).unwrap();
 
-    println!("parsed == {:#?}", parsed);
     assert_eq!(&*format!("{}", parsed), expected_pretty);
 }
 
